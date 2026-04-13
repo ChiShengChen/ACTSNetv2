@@ -1,6 +1,6 @@
-# ACTSNet v2 — Frequency-Aware Interpretable EEG Classification for TMS Response Prediction
+# ACTSNet v2 — Frequency-Aware Interpretable EEG / Time Series Classification
 
-**ACTSNet v2** is an evolution of the original [ACTSNet](../ACTSNet/), which was proposed as part of a 2021 NTU master's thesis. While preserving the core prototypical learning paradigm, v2 upgrades every module with 2023--2026 era techniques for improved accuracy and clinical interpretability.
+**ACTSNet v2** is an evolution of the original [ACTSNet](https://github.com/ChiShengChen/ACTSNetv1), which was proposed as part of a 2021 NTU master's thesis. While preserving the core prototypical learning paradigm, v2 upgrades every module with 2023--2026 era techniques for improved accuracy and interpretability. The architecture is designed as a **general-purpose model for EEG and multivariate time series classification**.
 
 > **Original thesis:** 基於注意力機制之時間序列原型卷積神經網路與傳統及量子機器學習模型應用於重度憂鬱症腦波之經顱磁刺激抗憂鬱療效預測與分析
 > (EEG Analysis for Prediction of Antidepressant Responses of Transcranial Magnetic Stimulation in Major Depressive Disorder Based on Attentional Convolution Time Series Prototypical Neural Network Model and Classical/Quantum Machine Learning Approaches)
@@ -16,24 +16,24 @@
 ```
 ACTSNet v1                                  ACTSNet v2
 ──────────────────────────────              ──────────────────────────────
-Input (B, 35, T)                            Input (B, 7, 5, T)
+Input (B, 35, T)                            Input (B, C, S, T)
   │                                           │
   ├─ MultiScaleEncoder                        ├─ RevIN normalize
   │   Random dim permutation                  │
   │   → shared Conv1D+BN+ReLU                ├─ PatchEmbedding
-  │   → GlobalPool → Concat                  │   → (B, 7, 5, N, d_model)
+  │   → GlobalPool → Concat                  │   → (B, C, S, N, d_model)
   │                                           │
   ├─ ACEncoder                                ├─ SubBandFusion
-  │   Conv1D×3 + IN + PReLU                  │   → (B, 7, N, d_model)
+  │   Conv1D×3 + IN + PReLU                  │   → (B, C, N, d_model)
   │   → Softmax ⊙ Mul                       │
   │   → FC → Sigmoid+IN → Pool               ├─ ChannelAttention
-  │                                           │   → (B, 7, N, d_model)
+  │                                           │   → (B, C, N, d_model)
   └─ Concat → FC                              │
        → Euclidean Prototypical               ├─ SpatialSpectralGraph (GCN)
-       → NLLLoss                              │   → (B, 7, N, d_model)
+       → NLLLoss                              │   → (B, C, N, d_model)
                                               │
                                               ├─ FreqLens Attention ×2
-                                              │   → (B, 7*N, d_model)
+                                              │   → (B, C*N, d_model)
                                               │
                                               ├─ Global Average Pool
                                               │   → (B, d_model)
@@ -46,29 +46,28 @@ Input (B, 35, T)                            Input (B, 7, 5, T)
 
 | Component | v1 | v2 | Motivation |
 |---|---|---|---|
-| **Input shape** | `(B, 35, T)` — flattened | `(B, 7, 5, T)` — electrodes × sub-bands | Preserve spatial-spectral structure |
+| **Input shape** | `(B, 35, T)` — flattened | `(B, C, S, T)` — channels × sub-bands | Preserve spatial-spectral structure |
 | **Feature extraction** | 3× Conv1D + InstanceNorm + PReLU | **PatchEmbedding** (PatchTST-style) | Better long-range temporal modeling |
-| **Normalization** | InstanceNorm1d | **RevIN** (reversible instance norm) | Handle EEG baseline drift across subjects |
+| **Normalization** | InstanceNorm1d | **RevIN** (reversible instance norm) | Handle distribution shift across samples |
 | **Attention** | `Softmax(X) ⊙ X` (channel softmax) | **FreqLens** (FFT → learnable filter → gate → iFFT) | Explicit frequency-domain discrimination |
-| **Sub-band handling** | 5 sub-bands flattened into 35 channels | **SubBandFusion** (learnable δ/θ/α/β/γ attention) | Discover which frequency bands matter for MDD |
-| **Channel encoding** | Random dimension permutation + shared Conv | **ChannelAttention** (multi-head + electrode embedding) | Learn spatial electrode relationships |
-| **Spatial modeling** | None | **SpatialSpectralGraph** (GCN on 10-20 topology) | Model inter-electrode connectivity |
+| **Sub-band handling** | Sub-bands flattened into channels | **SubBandFusion** (learnable sub-band attention) | Discover which frequency bands matter most |
+| **Channel encoding** | Random dimension permutation + shared Conv | **ChannelAttention** (multi-head + position embedding) | Learn spatial channel relationships |
+| **Spatial modeling** | None | **SpatialSpectralGraph** (GCN on channel topology) | Model inter-channel connectivity |
 | **Classification** | Euclidean prototypical (`-‖f(x)−hₖ‖²`) | **Hyperbolic prototypical** (Poincare geodesic distance) | Better class hierarchy representation |
 | **Prototype computation** | Recomputed each forward from batch (per-class `wₖ`, `Vₖ`) | Learnable tangent-space prototypes + momentum update | More stable training |
 | **Loss function** | NLLLoss | **CrossEntropy + Supervised Contrastive Loss** | Better embedding separation |
 | **Optimizer** | Adam | **AdamW** + CosineAnnealingWarmRestarts + grad clip | Regularization + stable hyperbolic training |
-| **Interpretability** | None | **InterpretabilityModule** (band/electrode/freq attribution + clinical report) | Clinical transparency |
-| **Preprocessing** | External (load `.npy`) | Built-in `EEGPreprocessor` (MNE + ICA + FIR) | End-to-end pipeline |
+| **Interpretability** | None | **InterpretabilityModule** (band/channel/freq attribution) | Model transparency |
 
 ### Key Design Decisions
 
-1. **Why separate electrodes and sub-bands?** v1 flattens 7×5=35 channels, losing the distinction between spatial (electrode) and spectral (sub-band) dimensions. v2 keeps them separate so SubBandFusion and ChannelAttention can operate on their respective axes independently.
+1. **Why separate channels and sub-bands?** v1 flattens all dimensions into a single channel axis, losing the distinction between spatial (channel) and spectral (sub-band) dimensions. v2 keeps them separate so SubBandFusion and ChannelAttention can operate on their respective axes independently.
 
-2. **Why FreqLens instead of simple softmax attention?** The original AC module (`Softmax(X) ⊙ X`) operates entirely in the time domain. FreqLens computes attention in the frequency domain via FFT, directly capturing which frequency components are discriminative for MDD — a natural fit for EEG data.
+2. **Why FreqLens instead of simple softmax attention?** The original AC module (`Softmax(X) ⊙ X`) operates entirely in the time domain. FreqLens computes attention in the frequency domain via FFT, directly capturing which frequency components are most discriminative — a natural fit for EEG and other periodic time series.
 
-3. **Why hyperbolic prototypes?** Euclidean distance treats all directions equally. Hyperbolic (Poincare) space naturally encodes hierarchical relationships and can better separate responder/non-responder clusters, especially with limited clinical data.
+3. **Why hyperbolic prototypes?** Euclidean distance treats all directions equally. Hyperbolic (Poincare) space naturally encodes hierarchical relationships and can better separate class clusters, especially with limited data.
 
-4. **Why add SupCon loss?** With small clinical datasets (typical in MDD-EEG), supervised contrastive loss helps learn better-separated embeddings before the prototype classification head.
+4. **Why add SupCon loss?** With small datasets, supervised contrastive loss helps learn better-separated embeddings before the prototype classification head.
 
 ## Installation
 
@@ -78,22 +77,31 @@ pip install -r requirements.txt
 
 ## Data Preparation
 
-Input shape: `(N, 7, 5, T)` — N segments, 7 electrodes (FP1/FP2/F7/F3/Fz/F4/F8), 5 sub-bands (delta/theta/alpha/beta/gamma), T timesteps.
+Input shape: `(N, C, S, T)` — N samples, C channels, S sub-bands (or feature groups), T timesteps.
+
+For EEG data, a built-in preprocessor is provided:
 
 ```python
 from preprocessing import EEGPreprocessor
 
 proc = EEGPreprocessor(sfreq=256, segment_sec=10)
-segments = proc.process('data/raw/patient001.edf')  # -> (N, 7, 5, 2560)
+segments = proc.process('data/raw/subject001.edf')  # -> (N, 7, 5, 2560)
+```
+
+For general time series, prepare your data as `.npy` arrays:
+
+```
+data/
+├── data.npy      # (N, C, S, T)
+└── labels.npy    # (N,)
 ```
 
 ## Training
 
 ```bash
 python train.py \
-    --data_path data/processed/rtms_eeg_processed.npy \
-    --labels_path data/processed/rtms_labels.npy \
-    --task rtms \
+    --data_path data/processed/data.npy \
+    --labels_path data/processed/labels.npy \
     --epochs 200 \
     --batch_size 32 \
     --d_model 128 \
@@ -102,7 +110,6 @@ python train.py \
 
 | Parameter | Default | Description |
 |---|---|---|
-| `--task` | rtms | `rtms` or `itbs` |
 | `--d_model` | 128 | Model dimension |
 | `--patch_len` | 32 | Patch length for PatchEmbedding |
 | `--n_freqlens_layers` | 2 | Number of FreqLens attention layers |
@@ -116,20 +123,20 @@ python train.py \
 
 ```bash
 python evaluate.py \
-    --checkpoint checkpoints/actsnet_v2_rtms_best.pt \
-    --data_path data/processed/rtms_test.npy \
-    --labels_path data/processed/rtms_test_labels.npy \
-    --output results/rtms_results.json
+    --checkpoint checkpoints/best_model.pt \
+    --data_path data/processed/test_data.npy \
+    --labels_path data/processed/test_labels.npy \
+    --output results/results.json
 ```
 
-Reports accuracy, precision, recall, F1-score, AUC-ROC, confusion matrix, per-sample predictions, and clinical interpretability reports (frequency band importance, electrode importance, channel connectivity).
+Reports accuracy, precision, recall, F1-score, AUC-ROC, confusion matrix, per-sample predictions, and interpretability reports (frequency band importance, channel importance, channel connectivity).
 
 ## Project Structure
 
 ```
 ACTSNetv2/
 ├── model.py                        # Full ACTSNetV2 assembly
-├── dataset.py                      # EEGDataset + EEGAugmentation
+├── dataset.py                      # Dataset + augmentation
 ├── losses.py                       # SupConLoss + ACTSNetV2Loss
 ├── preprocessing.py                # EEG preprocessing (MNE + ICA + FIR)
 ├── train.py                        # Training script
@@ -140,10 +147,10 @@ ACTSNetv2/
 │   ├── revin.py                    # Reversible Instance Normalization
 │   ├── freqlens_attention.py       # Frequency-domain attention (FFT)
 │   ├── subband_fusion.py           # Learnable sub-band mixing
-│   ├── channel_attention.py        # Multi-head electrode attention
-│   ├── spatial_spectral_graph.py   # GCN on electrode topology
+│   ├── channel_attention.py        # Multi-head channel attention
+│   ├── spatial_spectral_graph.py   # GCN on channel topology
 │   ├── hyperbolic_proto.py         # Poincare ball prototypical head
-│   └── interpretability.py         # Clinical attribution module
+│   └── interpretability.py         # Attribution module
 ├── config/
 │   ├── rtms_config.yaml
 │   └── itbs_config.yaml
