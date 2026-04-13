@@ -1,0 +1,22 @@
+task: rtms
+data_path: data/processed/rtms_eeg_processed.npy
+labels_path: data/processed/rtms_labels.npy
+
+# Model
+d_model: 128
+patch_len: 32
+n_freqlens_layers: 2
+dropout: 0.1
+
+# Training
+batch_size: 32
+lr: 0.001
+weight_decay: 0.0001
+epochs: 200
+lambda_supcon: 0.5
+val_ratio: 0.3
+seed: 42
+device: cuda
+
+# Output
+save_path: checkpoints
