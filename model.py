@@ -51,13 +51,19 @@ class ACTSNetV2(nn.Module):
         n_heads=4,
         n_freqlens_layers=2,
         dropout=0.1,
+        use_revin=True,
+        revin_per_sample=False,
     ):
         super().__init__()
         self.n_channels = n_channels
         self.n_subbands = n_subbands
+        self.use_revin = use_revin
 
         # --- Core Modules ---
-        self.revin = RevIN(num_features=n_channels * n_subbands)
+        self.revin = RevIN(
+            num_features=n_channels * n_subbands,
+            per_sample_only=revin_per_sample,
+        )
         self.patch_embed = PatchEmbedding(
             patch_len=patch_len, stride=patch_len, d_model=d_model, dropout=dropout
         )
@@ -86,6 +92,31 @@ class ACTSNetV2(nn.Module):
         # Storage for intermediate features (interpretability)
         self._last_patch_features = None
 
+    def encode(self, x):
+        """Pretrain-friendly forward: returns (per_patch_features, global_feature)
+        without the classification head.
+
+        x: (B, C, S, T)
+        returns:
+            per_patch: (B, C*N_patches, d_model)
+            global:    (B, d_model)
+        """
+        B, C, S, T = x.shape
+        if self.use_revin:
+            x_flat = x.reshape(B, C * S, T)
+            x_flat = self.revin.normalize(x_flat)
+            x = x_flat.reshape(B, C, S, T)
+        x = self.patch_embed(x)                   # (B, C, S, N, d)
+        x = self.subband_fusion(x)                # (B, C, N, d)
+        x = self.channel_attention(x)             # (B, C, N, d)
+        x = self.spatial_graph(x)                 # (B, C, N, d)
+        B, C, N, d = x.shape
+        x = x.reshape(B, C * N, d)
+        for fl in self.freqlens_layers:
+            x = fl(x)                             # (B, C*N, d)
+        global_feat = x.mean(dim=1)               # (B, d)
+        return x, global_feat
+
     def forward(self, x, labels=None):
         """
         x: (B, 7, 5, T) — batch, channels, subbands, time
@@ -94,10 +125,11 @@ class ACTSNetV2(nn.Module):
         """
         B, C, S, T = x.shape
 
-        # 1. RevIN normalize
-        x_flat = x.reshape(B, C * S, T)
-        x_flat = self.revin.normalize(x_flat)
-        x = x_flat.reshape(B, C, S, T)
+        # 1. RevIN normalize (optional)
+        if self.use_revin:
+            x_flat = x.reshape(B, C * S, T)
+            x_flat = self.revin.normalize(x_flat)
+            x = x_flat.reshape(B, C, S, T)
 
         # 2. Patch embedding
         x = self.patch_embed(x)  # (B, C, S, N, d_model)

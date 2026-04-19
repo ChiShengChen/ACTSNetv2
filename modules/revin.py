@@ -20,14 +20,22 @@ class RevIN(nn.Module):
         affine: whether to learn affine parameters
     """
 
-    def __init__(self, num_features, eps=1e-5, affine=True):
+    def __init__(self, num_features, eps=1e-5, affine=True, per_sample_only=False):
         super().__init__()
         self.num_features = num_features
         self.eps = eps
         self.affine = affine
+        # per_sample_only=True: one mean/std per sample across all non-batch dims.
+        # Preserves relative channel × sub-band structure (important when sub-bands
+        # have very different energies); only removes subject-level scale/offset.
+        self.per_sample_only = per_sample_only
         if affine:
-            self.gamma = nn.Parameter(torch.ones(1, num_features, 1))
-            self.beta = nn.Parameter(torch.zeros(1, num_features, 1))
+            if per_sample_only:
+                self.gamma = nn.Parameter(torch.ones(1))
+                self.beta = nn.Parameter(torch.zeros(1))
+            else:
+                self.gamma = nn.Parameter(torch.ones(1, num_features, 1))
+                self.beta = nn.Parameter(torch.zeros(1, num_features, 1))
         self._mean = None
         self._std = None
 
@@ -36,7 +44,10 @@ class RevIN(nn.Module):
         x: (B, C, T) or (B, C, ...)
         Stores mean/std for later denormalization.
         """
-        dim = tuple(range(2, x.ndim))  # normalize over time dims
+        if self.per_sample_only:
+            dim = tuple(range(1, x.ndim))  # all non-batch dims
+        else:
+            dim = tuple(range(2, x.ndim))  # per-channel over time
         self._mean = x.mean(dim=dim, keepdim=True).detach()
         self._std = (x.var(dim=dim, keepdim=True, unbiased=False) + self.eps).sqrt().detach()
         x = (x - self._mean) / self._std

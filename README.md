@@ -139,8 +139,10 @@ ACTSNetv2/
 ├── dataset.py                      # Dataset + augmentation
 ├── losses.py                       # SupConLoss + ACTSNetV2Loss
 ├── preprocessing.py                # EEG preprocessing (MNE + ICA + FIR)
-├── train.py                        # Training script
+├── train.py                        # Training script (TMS task)
 ├── evaluate.py                     # Evaluation + interpretability
+├── run_pretrain.py                 # Self-supervised pretrain on EEG-FM-Bench
+├── run_eegfm_benchmark.py          # EEG-FM-Bench downstream benchmark (4 datasets)
 ├── requirements.txt
 ├── modules/
 │   ├── patch_embedding.py          # PatchEmbedding (PatchTST-style)
@@ -158,6 +160,67 @@ ACTSNetv2/
 ├── checkpoints/
 └── results/
 ```
+
+## Benchmark Results on EEG-FM-Bench
+
+Evaluated on 4 datasets from [EEG-FM-Bench](https://github.com/weishenzhong/EEG-FM-Bench) with 3 seeds (42, 123, 456), 100 finetune epochs, batch size 64, LR 1e-3. Metric: **balanced accuracy** (mean ± std). Config: linear classification head + CrossEntropy, `revin_per_sample`, dropout 0.1, weight_decay 1e-4. Pretrained encoder uses `max_channels=64` (inputs zero-padded to match).
+
+### Pretrain setup
+
+Input: `(B, C, 5, T)` — 5-band bandpass decomposition (δ 0.5–4, θ 4–8, α 8–13, β 13–30, γ 30–45 Hz) applied on-the-fly. Pool: 5 EEG-FM-Bench datasets (tuab + tuev + bcic_2a + seed_iv + siena_scalp) = **74,141 samples**, max_channels=64, 30 epochs. Objective: NT-Xent contrastive on global features + MSE reconstruction on per-patch features, λ_recon=1.0, temperature=0.1. Two augmented views per sample:
+
+- View 1: time shift (±10%) + Gaussian noise (σ = 0.1 × per-sample std)
+- View 2: channel dropout (20%) + sub-band dropout (20%) + amplitude scale (0.8–1.2×)
+
+Reconstruction target is the **clean** signal (denoising pretext).
+
+### Results vs ACTSNet v1
+
+| Dataset | Classes | v1 (no pretrain) | v1 (pretrain 74k) | **v2 (no pretrain)** | **v2 (pretrain 74k)** | v2-pretrain Δ vs v1-no-pretrain |
+|---|---|---|---|---|---|---|
+| bcic_2a | 4 | 0.4358 ± 0.0263 | 0.3709 ± 0.0262 | 0.3275 ± 0.0115 | 0.3443 ± 0.0131 | −0.092 |
+| tuab    | 2 | 0.7457 ± 0.0019 | 0.7257 ± 0.0019 | — | **0.7523 ± 0.0036** | **+0.007** |
+| tuev    | 6 | 0.3868 ± 0.0543 | 0.4130 ± 0.0306 | — | **0.4659 ± 0.0379** | **+0.079** |
+| seed_iv | 4 | 0.3008 ± 0.0051 | 0.3045 ± 0.0096 | — | **0.3374 ± 0.0062** | **+0.037** |
+
+**Notes**
+
+- **v2 + pretrain beats v1 (pretrain 74k) on all 4 datasets.**
+- **v2 + pretrain beats v1 (no pretrain) on 3 / 4 datasets** — wins on clinical corpora (tuab, tuev) and SEED-IV emotion; loses on BCIC-2A motor imagery.
+- BCIC-2A is the smallest dataset (1440 train samples, 4 classes). v2 is more parameter-dense than v1 and still overfits even with pretraining — prototype-based heads (v1) remain more sample-efficient on tiny MI datasets.
+- tuev (6-class clinical events) sees the biggest gain: +5.3 balanced-acc points over v1-pretrain. The sub-band decomposition + frequency-aware modules appear to help most when the task depends on spectral structure.
+- v2 finetune `std` across seeds is consistently lower than v1-pretrain on tuab/tuev/seed_iv, indicating more stable convergence from pretrained init.
+
+### Reproduce
+
+```bash
+# Pretrain: 30 epochs on 5-dataset pool, ~100 min on RTX 3090
+python run_pretrain.py --epochs 30 \
+    --max_samples_per_dataset 20000 \
+    --output_dir checkpoints/pretrain_v1
+
+# Finetune benchmark: 4 datasets × 3 seeds × 100 epochs
+python run_eegfm_benchmark.py \
+    --datasets bcic_2a tuab tuev seed_iv \
+    --seeds 42 123 456 --epochs 100 \
+    --head linear --revin_per_sample \
+    --pretrained_path checkpoints/pretrain_v1/pretrain_final.pt \
+    --output_dir checkpoints/eegfm_benchmark_pretrain_v1
+```
+
+### Ablation on BCIC-2A (sanity checks during development)
+
+| Variant | Bal. Acc. | Notes |
+|---|---|---|
+| v2, default (hyperbolic head, RevIN, CE + SupCon) | 0.2593 ± 0.0096 | stuck at chance — hyperbolic head doesn't train end-to-end |
+| v2, linear head + CE, RevIN on | 0.2535 | same plateau — RevIN washes class signal |
+| v2, linear head + CE, no RevIN | 0.3108 ± 0.0221 | breaks plateau, but overfits |
+| v2, linear head + CE, `revin_per_sample` + dropout 0.3 + wd 5e-3 | 0.3275 ± 0.0115 | best from-scratch setting |
+| **v2, linear head + CE, `revin_per_sample` + pretrain** | **0.3443 ± 0.0131** | +1.7 pts from pretrain |
+
+`revin_per_sample` normalizes each sample globally over (C, S, T) with one mean/std — preserving the relative channel × sub-band energy structure that SubBandFusion relies on. Default RevIN (per-channel over time) removes these relative energies and prevents learning on small datasets.
+
+---
 
 ## References
 

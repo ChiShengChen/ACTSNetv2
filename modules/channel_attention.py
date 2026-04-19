@@ -21,12 +21,18 @@ class ChannelAttention(nn.Module):
         dropout: dropout rate
     """
 
-    def __init__(self, n_channels=7, d_model=128, n_heads=4, dropout=0.1):
+    def __init__(self, n_channels=7, d_model=128, n_heads=4, dropout=0.1,
+                 electrode_names=None):
         super().__init__()
         self.n_channels = n_channels
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
-        self.electrode_names = ['FP1', 'FP2', 'F7', 'F3', 'Fz', 'F4', 'F8']
+        if electrode_names is None:
+            electrode_names = (
+                ['FP1', 'FP2', 'F7', 'F3', 'Fz', 'F4', 'F8']
+                if n_channels == 7 else [f'ch{i}' for i in range(n_channels)]
+            )
+        self.electrode_names = electrode_names
 
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)

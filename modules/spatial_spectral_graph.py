@@ -21,25 +21,30 @@ class SpatialSpectralGraph(nn.Module):
         dropout: dropout rate
     """
 
-    def __init__(self, n_channels=7, d_model=128, n_layers=2, dropout=0.1):
+    def __init__(self, n_channels=7, d_model=128, n_layers=2, dropout=0.1,
+                 predefined_edges=None):
         super().__init__()
         self.n_channels = n_channels
 
-        # Predefined adjacency based on 10-20 system electrode positions
-        # FP1(0) FP2(1) F7(2) F3(3) Fz(4) F4(5) F8(6)
+        # Predefined adjacency based on 10-20 system electrode positions.
+        # Default 7-channel frontal montage: FP1(0) FP2(1) F7(2) F3(3) Fz(4) F4(5) F8(6).
+        # For other montages, pass predefined_edges=[] (learnable-only) or a custom edge list.
         adj = torch.zeros(n_channels, n_channels)
-        edges = [
-            (0, 1),  # FP1-FP2
-            (0, 2),  # FP1-F7
-            (0, 3),  # FP1-F3
-            (1, 5),  # FP2-F4
-            (1, 6),  # FP2-F8
-            (2, 3),  # F7-F3
-            (3, 4),  # F3-Fz
-            (4, 5),  # Fz-F4
-            (5, 6),  # F4-F8
-        ]
-        for i, j in edges:
+        if predefined_edges is None and n_channels == 7:
+            predefined_edges = [
+                (0, 1),  # FP1-FP2
+                (0, 2),  # FP1-F7
+                (0, 3),  # FP1-F3
+                (1, 5),  # FP2-F4
+                (1, 6),  # FP2-F8
+                (2, 3),  # F7-F3
+                (3, 4),  # F3-Fz
+                (4, 5),  # Fz-F4
+                (5, 6),  # F4-F8
+            ]
+        elif predefined_edges is None:
+            predefined_edges = []  # unknown montage — rely on learnable + self-loops
+        for i, j in predefined_edges:
             adj[i, j] = 1.0
             adj[j, i] = 1.0
         # Add self-loops
