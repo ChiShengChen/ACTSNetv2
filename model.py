@@ -53,6 +53,7 @@ class ACTSNetV2(nn.Module):
         dropout=0.1,
         use_revin=True,
         revin_per_sample=False,
+        spectral_inject=False,
     ):
         super().__init__()
         self.n_channels = n_channels
@@ -65,7 +66,8 @@ class ACTSNetV2(nn.Module):
             per_sample_only=revin_per_sample,
         )
         self.patch_embed = PatchEmbedding(
-            patch_len=patch_len, stride=patch_len, d_model=d_model, dropout=dropout
+            patch_len=patch_len, stride=patch_len, d_model=d_model, dropout=dropout,
+            use_spectral=spectral_inject,
         )
         self.subband_fusion = SubBandFusion(
             n_subbands=n_subbands, d_model=d_model, fusion_type='attention'

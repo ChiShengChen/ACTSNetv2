@@ -208,6 +208,41 @@ python run_eegfm_benchmark.py \
     --output_dir checkpoints/eegfm_benchmark_pretrain_v1
 ```
 
+### MI-specific LOSO (BCIC-2A, cross-subject, 9-fold per-subject)
+
+Comparable to the NSR 2026 EEG-FM benchmark recipe (LOSO, seed 42 per fold, mean ± std over 9 subject-held-out folds). See [run_mi_benchmark.py](run_mi_benchmark.py) — a stripped-down variant of the main benchmark with three MI-targeted changes:
+
+1. **Euclidean Alignment (EA)** — per-subject covariance whitening, applied before bandpass. Removes subject-level scale drift.
+2. **α + β bands only (n_subbands=2)** — MI-discriminative signal lives in mu (8–13 Hz) and beta (13–30 Hz); other bands add noise on small datasets.
+3. **Batch Prototype head** — classification via negative squared Euclidean distance to per-class prototypes re-computed each forward from the batch (v1-style metric learning regularization).
+4. **Spectral injection in PatchEmbedding** (CBraMod-style) — each patch's FFT magnitude is projected to `d_model` and added to the time-domain embedding, letting the model learn per-patch frequency weighting.
+
+| Variant | Bal. Acc. LOSO |
+|---|---|
+| ACTSNetv2 with pretrained v1 encoder, 5-band, linear head | 0.3225 ± 0.0262 |
+| MI: EA + α+β + Prototype (no pretrain) | 0.4190 ± 0.1053 |
+| **MI: EA + α+β + Prototype + spectral injection (best)** | **0.4653 ± 0.1290** |
+| MI: best above but `patch_len=128` (ablation) | 0.2990 ± 0.0175 |
+
+**Comparison with NSR 2026 EEG-FM benchmark (BNCI2014001 LOSO)**
+
+| Rank | Model | BCA % |
+|---|---|---|
+| 1 | MIRepNet* (MI-specific FM) | 54.21 |
+| 2 | CBraMod (FM) | 53.03 |
+| 3 | BENDR (FM) | 51.11 |
+| 4 | Neuro-GPT (FM) | 46.97 |
+| 5 | LaBraM (FM) | 46.93 |
+| 6 | LMDA | 46.80 |
+| **—** | **ACTSNetv2 MI (ours)** | **46.53** |
+| 7 | EEGMamba (FM) | 45.72 |
+| 8 | EEGNet (2K params) | 44.97 |
+| 9 | ShallowConv | 44.80 |
+
+ACTSNetv2 MI matches LaBraM / Neuro-GPT tier while being trained without any pretrain pool (these numbers are from-scratch cross-subject). The three MI-targeted tweaks together buy **+14.3 balanced-acc points** over the default-configured pretrained v2 (32.25 → 46.53).
+
+`patch_len=128` (0.5 s per patch at fs=256) does worse because MI event-related desynchronization unfolds on sub-100 ms scales — larger patches average out the discriminative dynamics.
+
 ### Ablation on BCIC-2A (sanity checks during development)
 
 | Variant | Bal. Acc. | Notes |

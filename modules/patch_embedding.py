@@ -19,16 +19,25 @@ class PatchEmbedding(nn.Module):
         dropout: dropout rate
     """
 
-    def __init__(self, patch_len=16, stride=16, d_model=128, dropout=0.1, max_n_patches=512):
+    def __init__(self, patch_len=16, stride=16, d_model=128, dropout=0.1,
+                 max_n_patches=512, use_spectral=False):
         super().__init__()
         self.patch_len = patch_len
         self.stride = stride
+        self.use_spectral = use_spectral
         self.projection = nn.Linear(patch_len, d_model)
         self.dropout = nn.Dropout(dropout)
         # Pre-allocate positional encoding as a proper registered parameter
         self.pos_encoding = nn.Parameter(
             torch.randn(max_n_patches, d_model) * 0.02
         )
+        # CBraMod-style spectral injection: FFT magnitude per patch
+        # is projected to d_model and added to the time-domain embedding.
+        # Lets the model attend to per-patch frequency content automatically
+        # rather than relying on fixed bandpass filters.
+        if use_spectral:
+            n_freqs = patch_len // 2 + 1
+            self.spectral_projection = nn.Linear(n_freqs, d_model)
 
     def forward(self, x):
         """
@@ -39,12 +48,16 @@ class PatchEmbedding(nn.Module):
         # Reshape to (B*C*S, T) for patch extraction
         x = x.reshape(B * C * S, T)
         # Unfold into patches: (B*C*S, n_patches, patch_len)
-        x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
-        n_patches = x.shape[1]
-        # Project patches
-        x = self.projection(x)  # (B*C*S, n_patches, d_model)
+        patches = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+        n_patches = patches.shape[1]
+        # Time-domain projection
+        emb = self.projection(patches)  # (B*C*S, n_patches, d_model)
+        # CBraMod-style spectral injection
+        if self.use_spectral:
+            spectral = torch.fft.rfft(patches, dim=-1, norm='forward')
+            spectral_mag = torch.abs(spectral)
+            emb = emb + self.spectral_projection(spectral_mag)
         # Add positional encoding (slice to actual n_patches)
-        x = self.dropout(x + self.pos_encoding[:n_patches])
+        emb = self.dropout(emb + self.pos_encoding[:n_patches])
         # Reshape back
-        x = x.reshape(B, C, S, n_patches, -1)
-        return x
+        return emb.reshape(B, C, S, n_patches, -1)

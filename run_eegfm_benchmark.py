@@ -109,6 +109,34 @@ def get_eegfm_root(dataset_name: str | None = None):
 # ──────────────────────────────────────────────
 # Arrow loading
 # ──────────────────────────────────────────────
+def load_arrow_all_with_subject(
+    root: str, dataset: str, version: str, max_time_len: int | None = None,
+):
+    """Pool train+validation+test splits, keeping subject IDs."""
+    all_data, all_labels, all_subj = [], [], []
+    for split in ("train", "validation", "test"):
+        base_dir = os.path.join(root, dataset, "finetune", version)
+        prefix = f"{dataset}-{split}-"
+        shards = sorted([
+            os.path.join(base_dir, f)
+            for f in os.listdir(base_dir)
+            if f.startswith(prefix) and f.endswith(".arrow")
+        ])
+        for shard_path in shards:
+            table = ipc.open_stream(shard_path).read_all()
+            for i in range(len(table)):
+                d = np.array(table.column("data")[i].as_py(), dtype=np.float32)
+                if max_time_len is not None and d.shape[-1] > max_time_len:
+                    d = d[:, :max_time_len]
+                all_data.append(d)
+                all_labels.append(int(table.column("label")[i].as_py()))
+                all_subj.append(str(table.column("subject")[i].as_py()))
+    data = np.stack(all_data, axis=0)
+    labels = np.array(all_labels, dtype=np.int64)
+    subjects = np.array(all_subj)
+    return data, labels, subjects
+
+
 def load_arrow_split(
     root: str, dataset: str, version: str, split: str,
     max_samples: int | None = None, max_time_len: int | None = None,
@@ -164,13 +192,19 @@ def build_band_filters(fs: int, order: int = 4):
     return sos_list
 
 
-def decompose_subbands(data: np.ndarray, sos_list) -> np.ndarray:
-    """(N, C, T) -> (N, C, 5, T) via 5 bandpass filters. Zero-phase filtfilt."""
+def decompose_subbands(data: np.ndarray, sos_list, chunk: int = 1024) -> np.ndarray:
+    """(N, C, T) -> (N, C, 5, T) via 5 bandpass filters. Zero-phase filtfilt.
+
+    Chunks along sample axis so scipy's float64 scratch stays bounded.
+    """
     N, C, T = data.shape
     out = np.empty((N, C, len(sos_list), T), dtype=np.float32)
-    for s_idx, sos in enumerate(sos_list):
-        filtered = sosfiltfilt(sos, data, axis=-1)
-        out[:, :, s_idx, :] = filtered.astype(np.float32)
+    for i in range(0, N, chunk):
+        chunk_data = data[i:i + chunk]
+        for s_idx, sos in enumerate(sos_list):
+            out[i:i + chunk, :, s_idx, :] = sosfiltfilt(
+                sos, chunk_data, axis=-1
+            ).astype(np.float32)
     return out
 
 
@@ -235,6 +269,184 @@ def evaluate(model, loader, device):
         "weighted_f1": f1_score(all_labels, all_preds, average="weighted", zero_division=0),
         "accuracy": accuracy_score(all_labels, all_preds),
     }
+
+
+# ──────────────────────────────────────────────
+# LOSO cross-subject driver
+# ──────────────────────────────────────────────
+def run_single_dataset_loso(
+    dataset_name: str,
+    eegfm_root: str,
+    seed: int,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    device: torch.device,
+    logger: logging.Logger,
+    fs: int,
+    max_time_len: int | None,
+    max_train_samples: int | None,
+    d_model: int,
+    patch_len: int,
+    weight_decay: float,
+    dropout: float,
+    pretrained_path: str | None,
+    max_channels: int | None,
+    freeze_encoder: bool,
+    revin_per_sample: bool,
+    use_revin: bool,
+    n_folds: int,
+    max_total_samples: int | None,
+):
+    """Cross-subject LOSO: small datasets use per-subject folds;
+    large datasets (subjects > n_folds) use k-fold grouped by subject."""
+    info = EEGFM_DATASETS[dataset_name]
+    n_classes = info["n_classes"]
+    version = info["version"]
+
+    logger.info(f"Loading {dataset_name} (all splits, with subject IDs) ...")
+    t0 = time.time()
+    data, labels, subjects = load_arrow_all_with_subject(
+        eegfm_root, dataset_name, version, max_time_len=max_time_len,
+    )
+    logger.info(f"  Loaded {len(data)} samples in {time.time()-t0:.0f}s "
+                f"| shape {data.shape} | unique subjects: {len(np.unique(subjects))}")
+
+    # Memory cap: subsample total pool (stratified per subject) if too big.
+    # Bandpass expansion is 5× so pool must fit within ~100 GB post-expansion.
+    if max_total_samples is not None and len(data) > max_total_samples:
+        rng = np.random.RandomState(seed)
+        unique_subj = np.unique(subjects)
+        per_subj_cap = max(1, max_total_samples // len(unique_subj))
+        keep_idx = []
+        for s in unique_subj:
+            s_idx = np.where(subjects == s)[0]
+            if len(s_idx) > per_subj_cap:
+                s_idx = rng.choice(s_idx, per_subj_cap, replace=False)
+            keep_idx.append(s_idx)
+        keep_idx = np.sort(np.concatenate(keep_idx))
+        data = data[keep_idx]
+        labels = labels[keep_idx]
+        subjects = subjects[keep_idx]
+        logger.info(f"  Subsampled to {len(data)} samples "
+                    f"(~{per_subj_cap}/subject, stratified)")
+
+    # Zero-pad channels if using pretrained_path with max_channels
+    if pretrained_path is not None and max_channels is not None:
+        C = data.shape[1]
+        if C < max_channels:
+            pad = np.zeros((len(data), max_channels - C, data.shape[2]), dtype=np.float32)
+            data = np.concatenate([data, pad], axis=1)
+            logger.info(f"  Padded channels {C} -> {max_channels}")
+        elif C > max_channels:
+            data = data[:, :max_channels, :]
+            logger.info(f"  Truncated channels to {max_channels}")
+
+    logger.info(f"Decomposing sub-bands (fs={fs}) ...")
+    t0 = time.time()
+    sos_list = build_band_filters(fs=fs)
+    data_5b = decompose_subbands(data, sos_list)
+    logger.info(f"  Decomposed in {time.time()-t0:.0f}s | shape {data_5b.shape}")
+    del data
+    n_channels = data_5b.shape[1]
+    n_timesteps = data_5b.shape[3]
+
+    unique_subj = np.unique(subjects)
+    n_unique = len(unique_subj)
+
+    if n_unique <= n_folds:
+        # Per-subject LOSO
+        fold_assignments = [(s, np.array([s])) for s in unique_subj]
+        logger.info(f"Using per-subject LOSO: {n_unique} folds")
+    else:
+        # K-fold grouped by subject
+        rng = np.random.RandomState(seed)
+        shuffled = rng.permutation(unique_subj)
+        groups = np.array_split(shuffled, n_folds)
+        fold_assignments = [(f"fold{i}", g) for i, g in enumerate(groups)]
+        logger.info(f"Using {n_folds}-fold grouped LOSO: {n_unique} subjects in {n_folds} groups")
+
+    fold_metrics: list[dict] = []
+
+    for fold_idx, (fold_id, test_subjects) in enumerate(fold_assignments):
+        test_mask = np.isin(subjects, test_subjects)
+        train_mask = ~test_mask
+
+        train_data_fold = data_5b[train_mask]
+        train_labels_fold = labels[train_mask]
+        test_data_fold = data_5b[test_mask]
+        test_labels_fold = labels[test_mask]
+
+        # Subsample training data if too large
+        if max_train_samples is not None and len(train_data_fold) > max_train_samples:
+            rng = np.random.RandomState(seed)
+            idx = rng.choice(len(train_data_fold), max_train_samples, replace=False)
+            train_data_fold = train_data_fold[idx]
+            train_labels_fold = train_labels_fold[idx]
+
+        logger.info(f"\n{'='*60}\nFold {fold_idx+1}/{len(fold_assignments)} "
+                    f"[{fold_id}] | test subjects: {len(test_subjects)} | "
+                    f"train: {len(train_data_fold)}, test: {len(test_data_fold)}")
+
+        set_seed(seed)
+        train_ds = SubbandEEGDataset(train_data_fold, train_labels_fold)
+        test_ds = SubbandEEGDataset(test_data_fold, test_labels_fold)
+        # num_workers=0 avoids fork-COW blowup on the large bandpass tensor
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                                  drop_last=True, num_workers=0)
+        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+                                 num_workers=0)
+
+        seq_len = n_timesteps - (n_timesteps % patch_len)
+        model = ACTSNetV2(
+            n_channels=n_channels, n_subbands=len(SUBBANDS),
+            seq_len=seq_len, patch_len=patch_len, d_model=d_model,
+            n_classes=n_classes, n_heads=4, n_freqlens_layers=2,
+            dropout=dropout, use_revin=use_revin, revin_per_sample=revin_per_sample,
+        )
+        model.proto_head = LinearHead(d_model=d_model, n_classes=n_classes)
+        if pretrained_path is not None:
+            model = load_pretrained_encoder(model, pretrained_path, logger)
+        model = model.to(device)
+        if freeze_encoder:
+            for name, p in model.named_parameters():
+                if not name.startswith("proto_head."):
+                    p.requires_grad = False
+
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epochs, eta_min=1e-6
+        )
+        loss_fn = nn.CrossEntropyLoss().to(device)
+
+        best_metrics = None
+        best_bal_acc = 0.0
+        for epoch in range(1, epochs + 1):
+            train_loss = train_one_epoch(model, train_loader, loss_fn, optimizer,
+                                         device, use_supcon=False)
+            scheduler.step()
+            if epoch % 10 == 0 or epoch == epochs:
+                metrics = evaluate(model, test_loader, device)
+                if metrics["balanced_accuracy"] > best_bal_acc:
+                    best_bal_acc = metrics["balanced_accuracy"]
+                    best_metrics = metrics.copy()
+
+        logger.info(f"  Fold {fold_idx+1} best: {best_metrics}")
+        fold_metrics.append(best_metrics)
+        del model, optimizer, scheduler, loss_fn, train_loader, test_loader
+        del train_ds, test_ds, train_data_fold, test_data_fold
+        import gc; gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    logger.info(f"\n{'='*60}\nDataset: {dataset_name} — LOSO Final ({len(fold_metrics)} folds):")
+    final = {}
+    for k in fold_metrics[0].keys():
+        vals = np.array([m[k] for m in fold_metrics])
+        final[k] = (vals.mean(), vals.std())
+        logger.info(f"  {k}: {vals.mean():.4f} ± {vals.std():.4f}")
+    return final
 
 
 # ──────────────────────────────────────────────
@@ -441,6 +653,16 @@ def main():
                         help="max_channels the pretrain used; input channels will be padded/truncated")
     parser.add_argument("--freeze_encoder", action="store_true",
                         help="Freeze encoder, train only the head (linear probe)")
+    parser.add_argument("--loso", action="store_true",
+                        help="Cross-subject LOSO: small datasets per-subject, "
+                             "large datasets k-fold grouped by subject")
+    parser.add_argument("--loso_n_folds", type=int, default=10,
+                        help="Number of folds for large (subjects > n_folds) datasets")
+    parser.add_argument("--loso_seed", type=int, default=42,
+                        help="Seed for LOSO (single-seed-per-fold is standard)")
+    parser.add_argument("--loso_max_total_samples", type=int, default=None,
+                        help="Cap total pool before bandpass (stratified by subject); "
+                             "use for tuev/tuab to avoid 138+ GB numpy alloc")
     parser.add_argument("--output_dir", type=str, default="checkpoints/eegfm_benchmark")
     args = parser.parse_args()
 
@@ -467,33 +689,59 @@ def main():
 
     all_results = {}
     for ds in args.datasets:
-        logger.info(f"\n{'#'*60}\n# Dataset: {ds}\n{'#'*60}")
+        logger.info(f"\n{'#'*60}\n# Dataset: {ds}  ({'LOSO' if args.loso else 'random split'})\n{'#'*60}")
         try:
             eegfm_root = get_eegfm_root(ds)
-            result = run_single_dataset(
-                dataset_name=ds,
-                eegfm_root=eegfm_root,
-                seeds=args.seeds,
-                epochs=args.epochs,
-                batch_size=args.batch_size,
-                lr=args.lr,
-                device=device,
-                logger=logger,
-                fs=args.fs,
-                max_time_len=args.max_time_len,
-                max_train_samples=args.max_train_samples,
-                d_model=args.d_model,
-                patch_len=args.patch_len,
-                lambda_supcon=args.lambda_supcon,
-                weight_decay=args.weight_decay,
-                head=args.head,
-                use_revin=not args.no_revin,
-                revin_per_sample=args.revin_per_sample,
-                dropout=args.dropout,
-                pretrained_path=args.pretrained_path,
-                max_channels=args.pretrained_max_channels,
-                freeze_encoder=args.freeze_encoder,
-            )
+            if args.loso:
+                result = run_single_dataset_loso(
+                    dataset_name=ds,
+                    eegfm_root=eegfm_root,
+                    seed=args.loso_seed,
+                    epochs=args.epochs,
+                    batch_size=args.batch_size,
+                    lr=args.lr,
+                    device=device,
+                    logger=logger,
+                    fs=args.fs,
+                    max_time_len=args.max_time_len,
+                    max_train_samples=args.max_train_samples,
+                    d_model=args.d_model,
+                    patch_len=args.patch_len,
+                    weight_decay=args.weight_decay,
+                    dropout=args.dropout,
+                    pretrained_path=args.pretrained_path,
+                    max_channels=args.pretrained_max_channels,
+                    freeze_encoder=args.freeze_encoder,
+                    revin_per_sample=args.revin_per_sample,
+                    use_revin=not args.no_revin,
+                    n_folds=args.loso_n_folds,
+                    max_total_samples=args.loso_max_total_samples,
+                )
+            else:
+                result = run_single_dataset(
+                    dataset_name=ds,
+                    eegfm_root=eegfm_root,
+                    seeds=args.seeds,
+                    epochs=args.epochs,
+                    batch_size=args.batch_size,
+                    lr=args.lr,
+                    device=device,
+                    logger=logger,
+                    fs=args.fs,
+                    max_time_len=args.max_time_len,
+                    max_train_samples=args.max_train_samples,
+                    d_model=args.d_model,
+                    patch_len=args.patch_len,
+                    lambda_supcon=args.lambda_supcon,
+                    weight_decay=args.weight_decay,
+                    head=args.head,
+                    use_revin=not args.no_revin,
+                    revin_per_sample=args.revin_per_sample,
+                    dropout=args.dropout,
+                    pretrained_path=args.pretrained_path,
+                    max_channels=args.pretrained_max_channels,
+                    freeze_encoder=args.freeze_encoder,
+                )
             all_results[ds] = result
         except Exception as e:
             logger.error(f"Failed on {ds}: {e}", exc_info=True)
