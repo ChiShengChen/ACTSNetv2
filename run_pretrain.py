@@ -343,6 +343,8 @@ def main():
     parser.add_argument("--revin_per_sample", action="store_true", default=True,
                         help="Use per-sample RevIN (recommended for EEG-FM pretrain)")
     parser.add_argument("--no_revin", action="store_true")
+    parser.add_argument("--no_spectral", action="store_true",
+                        help="Disable CBraMod-style spectral injection (default: on)")
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--output_dir", type=str, default="checkpoints/pretrain_v1")
@@ -413,6 +415,7 @@ def main():
         dropout=args.dropout,
         use_revin=not args.no_revin,
         revin_per_sample=args.revin_per_sample,
+        spectral_inject=not args.no_spectral,
     )
     pretrainer = V2Pretrainer(
         encoder=encoder, d_model=args.d_model, n_subbands=len(SUBBANDS),

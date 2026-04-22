@@ -230,7 +230,7 @@ Comparable to the NSR 2026 EEG-FM benchmark recipe (LOSO, seed 42 per fold, mean
 1. **Euclidean Alignment (EA)** — per-subject covariance whitening, applied before bandpass. Removes subject-level scale drift.
 2. **α + β bands only (n_subbands=2)** — MI-discriminative signal lives in mu (8–13 Hz) and beta (13–30 Hz); other bands add noise on small datasets.
 3. **Batch Prototype head** — classification via negative squared Euclidean distance to per-class prototypes re-computed each forward from the batch (v1-style metric learning regularization).
-4. **Spectral injection in PatchEmbedding** (CBraMod-style) — each patch's FFT magnitude is projected to `d_model` and added to the time-domain embedding, letting the model learn per-patch frequency weighting.
+4. **Spectral injection in PatchEmbedding** (CBraMod-style) — each patch's FFT magnitude is projected to `d_model` and added to the time-domain embedding, letting the model learn per-patch frequency weighting. **This is on by default** in the main model (`spectral_inject=True`); disable with `--no_spectral` for ablation. Note: the `pretrain_v1_30ep` checkpoint predates this change, so its `spectral_projection` layer will initialize from scratch when loaded (the rest of the encoder still benefits from pretraining).
 
 | Variant | Bal. Acc. LOSO |
 |---|---|

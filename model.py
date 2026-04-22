@@ -53,7 +53,7 @@ class ACTSNetV2(nn.Module):
         dropout=0.1,
         use_revin=True,
         revin_per_sample=False,
-        spectral_inject=False,
+        spectral_inject=True,
     ):
         super().__init__()
         self.n_channels = n_channels

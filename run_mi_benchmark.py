@@ -468,9 +468,8 @@ def main():
     parser.add_argument("--revin_per_sample", action="store_true", default=True)
     parser.add_argument("--no_ea", action="store_true",
                         help="Disable Euclidean Alignment (for ablation)")
-    parser.add_argument("--spectral_inject", action="store_true",
-                        help="CBraMod-style: per-patch FFT magnitude added to "
-                             "patch embedding (lets model attend to per-patch frequency)")
+    parser.add_argument("--no_spectral", action="store_true",
+                        help="Disable CBraMod-style spectral injection (default: on)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n_folds", type=int, default=10)
     parser.add_argument("--loso_max_total_samples", type=int, default=None,
@@ -485,7 +484,7 @@ def main():
     logger.info("ACTSNetv2 MI-specific Benchmark (EA + α+β + Prototype)")
     logger.info(f"Datasets: {args.datasets} | seed: {args.seed} | folds: {args.n_folds}")
     logger.info(f"EA: {not args.no_ea} | Subbands: α+β (2) | "
-                f"Spectral inject: {args.spectral_inject}")
+                f"Spectral inject: {not args.no_spectral}")
     logger.info(f"Device: {device} | epochs: {args.epochs} | bs: {args.batch_size}")
 
     all_results = {}
@@ -511,7 +510,7 @@ def main():
                 revin_per_sample=args.revin_per_sample,
                 n_folds=args.n_folds,
                 do_ea=not args.no_ea,
-                spectral_inject=args.spectral_inject,
+                spectral_inject=not args.no_spectral,
                 max_total_samples=args.loso_max_total_samples,
             )
             all_results[ds] = result

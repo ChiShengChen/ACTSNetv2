@@ -20,7 +20,7 @@ class PatchEmbedding(nn.Module):
     """
 
     def __init__(self, patch_len=16, stride=16, d_model=128, dropout=0.1,
-                 max_n_patches=512, use_spectral=False):
+                 max_n_patches=512, use_spectral=True):
         super().__init__()
         self.patch_len = patch_len
         self.stride = stride

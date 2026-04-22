@@ -349,6 +349,7 @@ def run_single_dataset_loso(
     use_revin: bool,
     n_folds: int,
     max_total_samples: int | None,
+    spectral_inject: bool = True,
 ):
     """Cross-subject LOSO: small datasets use per-subject folds;
     large datasets (subjects > n_folds) use k-fold grouped by subject."""
@@ -439,6 +440,7 @@ def run_single_dataset_loso(
             seq_len=seq_len, patch_len=patch_len, d_model=d_model,
             n_classes=n_classes, n_heads=4, n_freqlens_layers=2,
             dropout=dropout, use_revin=use_revin, revin_per_sample=revin_per_sample,
+            spectral_inject=spectral_inject,
         )
         model.proto_head = LinearHead(d_model=d_model, n_classes=n_classes)
         if pretrained_path is not None:
@@ -511,6 +513,7 @@ def run_single_dataset(
     pretrained_path: str | None,
     max_channels: int | None,
     freeze_encoder: bool,
+    spectral_inject: bool,
 ):
     info = EEGFM_DATASETS[dataset_name]
     n_classes = info["n_classes"]
@@ -587,6 +590,7 @@ def run_single_dataset(
             dropout=dropout,
             use_revin=use_revin,
             revin_per_sample=revin_per_sample,
+            spectral_inject=spectral_inject,
         )
         if head == "linear":
             model.proto_head = LinearHead(d_model=d_model, n_classes=n_classes)
@@ -679,6 +683,9 @@ def main():
                              "'hyperbolic' = v2 native Hyperbolic Prototypical + CE + SupCon")
     parser.add_argument("--no_revin", action="store_true",
                         help="Disable RevIN entirely")
+    parser.add_argument("--no_spectral", action="store_true",
+                        help="Disable CBraMod-style spectral injection in PatchEmbedding "
+                             "(default: on)")
     parser.add_argument("--revin_per_sample", action="store_true",
                         help="RevIN normalizes per-sample globally (one mean/std per sample) "
                              "instead of per-channel over time. Preserves relative "
@@ -752,6 +759,7 @@ def main():
                     use_revin=not args.no_revin,
                     n_folds=args.loso_n_folds,
                     max_total_samples=args.loso_max_total_samples,
+                    spectral_inject=not args.no_spectral,
                 )
             else:
                 result = run_single_dataset(
@@ -777,6 +785,7 @@ def main():
                     pretrained_path=args.pretrained_path,
                     max_channels=args.pretrained_max_channels,
                     freeze_encoder=args.freeze_encoder,
+                    spectral_inject=not args.no_spectral,
                 )
             all_results[ds] = result
         except Exception as e:
