@@ -258,6 +258,16 @@ ACTSNetv2 MI matches LaBraM / Neuro-GPT tier while being trained without any pre
 
 `patch_len=128` (0.5 s per patch at fs=256) does worse because MI event-related desynchronization unfolds on sub-100 ms scales — larger patches average out the discriminative dynamics.
 
+**Applying the MI stack to TUAB (non-MI ablation)** — we re-ran the full MI pipeline (EA + α+β + Prototype + Spectral) on TUAB to test whether these tweaks generalize. They do not:
+
+| Variant | TUAB LOSO BalAcc |
+|---|---|
+| v2 pretrained (5-band, linear head) | **0.7466 ± 0.0175** |
+| MI stack (α+β, Prototype, EA, Spectral) | 0.7349 ± 0.0260 |
+| Δ | −0.012 |
+
+The α+β restriction is MI-specific: abnormal EEG detection relies on the full spectrum (δ for slow-wave abnormalities, θ for drowsiness, γ for high-frequency activity). The +14.3-point gain on BCIC-2A is therefore a paradigm-matching effect, not a generally-applicable recipe.
+
 ### Ablation on BCIC-2A (sanity checks during development)
 
 | Variant | Bal. Acc. | Notes |

@@ -73,26 +73,76 @@ def get_eegfm_root(dataset_name: str):
     raise FileNotFoundError(f"Data root not found for {dataset_name}")
 
 
-def load_arrow_all_with_subject(root, dataset, version, max_time_len=None):
-    all_data, all_labels, all_subj = [], [], []
-    for split in ("train", "validation", "test"):
-        base_dir = os.path.join(root, dataset, "finetune", version)
-        prefix = f"{dataset}-{split}-"
-        shards = sorted([
-            os.path.join(base_dir, f)
-            for f in os.listdir(base_dir)
-            if f.startswith(prefix) and f.endswith(".arrow")
-        ])
-        for sp in shards:
-            table = ipc.open_stream(sp).read_all()
-            for i in range(len(table)):
-                d = np.array(table.column("data")[i].as_py(), dtype=np.float32)
+def load_arrow_all_with_subject(root, dataset, version, max_time_len=None,
+                                 max_samples=None, seed=42):
+    """Memory-safe two-pass loader: scan subjects first, subsample, then
+    pre-allocate and read only selected indices. Avoids Python-list OOM on
+    large pools like tuab (272k samples)."""
+    base_dir = os.path.join(root, dataset, "finetune", version)
+
+    def _iter_shards():
+        for split in ("train", "validation", "test"):
+            prefix = f"{dataset}-{split}-"
+            shards = sorted([
+                os.path.join(base_dir, f)
+                for f in os.listdir(base_dir)
+                if f.startswith(prefix) and f.endswith(".arrow")
+            ])
+            for s in shards:
+                yield s
+
+    # Pass 1: subjects + shape probe
+    subject_per_idx: list[str] = []
+    probe_shape = None
+    for sp in _iter_shards():
+        table = ipc.open_stream(sp).read_all()
+        if probe_shape is None and len(table) > 0:
+            d0 = np.asarray(table.column("data")[0].as_py(), dtype=np.float32)
+            probe_shape = d0.shape
+        subject_per_idx.extend(str(s.as_py()) for s in table.column("subject"))
+    subject_per_idx = np.array(subject_per_idx)
+    total = len(subject_per_idx)
+    if probe_shape is None:
+        raise RuntimeError(f"No samples found for {dataset}")
+    C, T_raw = probe_shape
+    T = min(T_raw, max_time_len) if max_time_len is not None else T_raw
+
+    # Stratified subsample decision
+    if max_samples is not None and total > max_samples:
+        unique_subj = np.unique(subject_per_idx)
+        per_cap = max(1, max_samples // len(unique_subj))
+        rng = np.random.RandomState(seed)
+        keep_idx_set: set[int] = set()
+        for s in unique_subj:
+            s_idx = np.where(subject_per_idx == s)[0]
+            if len(s_idx) > per_cap:
+                s_idx = rng.choice(s_idx, per_cap, replace=False)
+            keep_idx_set.update(int(i) for i in s_idx)
+        keep_idx = np.sort(np.array(sorted(keep_idx_set), dtype=np.int64))
+    else:
+        keep_idx = None
+    n_keep = len(keep_idx) if keep_idx is not None else total
+
+    data = np.empty((n_keep, C, T), dtype=np.float32)
+    labels = np.empty((n_keep,), dtype=np.int64)
+    subjects_out = np.empty((n_keep,), dtype=subject_per_idx.dtype)
+    keep_set = set(keep_idx.tolist()) if keep_idx is not None else None
+    keep_pos = {g: p for p, g in enumerate(keep_idx.tolist())} if keep_idx is not None else None
+
+    gi = 0
+    for sp in _iter_shards():
+        table = ipc.open_stream(sp).read_all()
+        for i in range(len(table)):
+            if keep_set is None or gi in keep_set:
+                d = np.asarray(table.column("data")[i].as_py(), dtype=np.float32)
                 if max_time_len is not None and d.shape[-1] > max_time_len:
                     d = d[:, :max_time_len]
-                all_data.append(d)
-                all_labels.append(int(table.column("label")[i].as_py()))
-                all_subj.append(str(table.column("subject")[i].as_py()))
-    return np.stack(all_data), np.array(all_labels, dtype=np.int64), np.array(all_subj)
+                pos = gi if keep_pos is None else keep_pos[gi]
+                data[pos] = d
+                labels[pos] = int(table.column("label")[i].as_py())
+                subjects_out[pos] = subject_per_idx[gi]
+            gi += 1
+    return data, labels, subjects_out
 
 
 # ──────────────────────────────────────────────
@@ -288,7 +338,8 @@ def evaluate(model, train_loader, test_loader, device, max_support=3000):
 # ──────────────────────────────────────────────
 def run_loso(dataset_name, eegfm_root, seed, epochs, batch_size, lr, device,
              logger, fs, max_time_len, d_model, patch_len, dropout, weight_decay,
-             use_revin, revin_per_sample, n_folds, do_ea, spectral_inject):
+             use_revin, revin_per_sample, n_folds, do_ea, spectral_inject,
+             max_total_samples):
     info = EEGFM_DATASETS[dataset_name]
     n_classes = info["n_classes"]
     version = info["version"]
@@ -296,7 +347,8 @@ def run_loso(dataset_name, eegfm_root, seed, epochs, batch_size, lr, device,
     logger.info(f"Loading {dataset_name} ...")
     t0 = time.time()
     data, labels, subjects = load_arrow_all_with_subject(
-        eegfm_root, dataset_name, version, max_time_len=max_time_len
+        eegfm_root, dataset_name, version, max_time_len=max_time_len,
+        max_samples=max_total_samples, seed=seed,
     )
     n_channels_raw = data.shape[1]
     n_timesteps = data.shape[2]
@@ -421,6 +473,9 @@ def main():
                              "patch embedding (lets model attend to per-patch frequency)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n_folds", type=int, default=10)
+    parser.add_argument("--loso_max_total_samples", type=int, default=None,
+                        help="Cap total pool before bandpass (stratified by subject); "
+                             "use for large datasets like tuab/tuev to avoid OOM")
     parser.add_argument("--output_dir", type=str, default="checkpoints/mi_benchmark")
     args = parser.parse_args()
 
@@ -457,6 +512,7 @@ def main():
                 n_folds=args.n_folds,
                 do_ea=not args.no_ea,
                 spectral_inject=args.spectral_inject,
+                max_total_samples=args.loso_max_total_samples,
             )
             all_results[ds] = result
         except Exception as e:
