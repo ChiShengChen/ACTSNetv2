@@ -74,10 +74,12 @@ class LinearHead(nn.Module):
 # Dataset info (matches ACTSNet v1)
 # ──────────────────────────────────────────────
 EEGFM_DATASETS = {
-    "bcic_2a": {"n_classes": 4, "version": "1.0.0"},
-    "seed_iv": {"n_classes": 4, "version": "1.0.0"},
-    "tuab":    {"n_classes": 2, "version": "3.0.1"},
-    "tuev":    {"n_classes": 6, "version": "2.0.0"},
+    "bcic_2a":     {"n_classes": 4, "version": "1.0.0"},
+    "seed_iv":     {"n_classes": 4, "version": "1.0.0"},
+    "tuab":        {"n_classes": 2, "version": "3.0.1"},
+    "tuev":        {"n_classes": 6, "version": "2.0.0"},
+    "tusl":        {"n_classes": 3, "version": "2.0.1"},
+    "siena_scalp": {"n_classes": 2, "version": "1.0.0"},
 }
 
 EEGFM_ROOT_CANDIDATES = [

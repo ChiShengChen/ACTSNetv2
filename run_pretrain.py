@@ -57,10 +57,16 @@ def get_eegfm_root(dataset_name: str):
     raise FileNotFoundError(f"Data root not found for {dataset_name}")
 
 
-def load_arrow_data(root, dataset, version, split, max_samples=None, max_time_len=1024):
-    base_dir = os.path.join(root, dataset, "finetune", version)
-    if not os.path.isdir(base_dir):
-        base_dir = os.path.join(root, dataset, "pretrain", version)
+def load_arrow_data(root, dataset, version, split, max_samples=None, max_time_len=1024,
+                    subfolder=None):
+    """Load EEG-FM-Bench arrow shards. subfolder ∈ {None, 'finetune', 'pretrain'}.
+    If None, tries finetune first and falls back to pretrain."""
+    if subfolder is not None:
+        base_dir = os.path.join(root, dataset, subfolder, version)
+    else:
+        base_dir = os.path.join(root, dataset, "finetune", version)
+        if not os.path.isdir(base_dir):
+            base_dir = os.path.join(root, dataset, "pretrain", version)
     prefix = f"{dataset}-{split}-"
     shards = sorted([
         os.path.join(base_dir, f)
@@ -70,27 +76,46 @@ def load_arrow_data(root, dataset, version, split, max_samples=None, max_time_le
     if not shards:
         raise FileNotFoundError(f"No shards for {dataset}/{split}")
 
+    # Pass 1: count + shape probe (no data loaded)
     total = 0
+    probe_shape = None
     for s in shards:
-        total += len(ipc.open_stream(s).read_all())
+        table = ipc.open_stream(s).read_all()
+        if probe_shape is None and len(table) > 0:
+            d0 = np.asarray(table.column("data")[0].as_py(), dtype=np.float32)
+            probe_shape = d0.shape
+        total += len(table)
+    if probe_shape is None:
+        raise RuntimeError(f"No samples found in {base_dir}")
+    C, T_raw = probe_shape
+    T = min(T_raw, max_time_len) if max_time_len else T_raw
+
+    # Subsample decision
     if max_samples and total > max_samples:
         rng = np.random.RandomState(42)
-        keep = set(rng.choice(total, max_samples, replace=False).tolist())
+        keep_arr = np.sort(rng.choice(total, max_samples, replace=False))
+        keep_set = set(int(i) for i in keep_arr)
+        keep_pos = {g: p for p, g in enumerate(keep_arr.tolist())}
+        n_keep = max_samples
     else:
-        keep = None
+        keep_set = None
+        keep_pos = None
+        n_keep = total
 
-    all_data = []
-    idx = 0
+    # Pass 2: pre-allocate exact-size output + fill only kept indices
+    out = np.empty((n_keep, C, T), dtype=np.float32)
+    gi = 0
     for s in shards:
         table = ipc.open_stream(s).read_all()
         for i in range(len(table)):
-            if keep is None or idx in keep:
-                d = np.array(table.column("data")[i].as_py(), dtype=np.float32)
+            if keep_set is None or gi in keep_set:
+                d = np.asarray(table.column("data")[i].as_py(), dtype=np.float32)
                 if max_time_len and d.shape[-1] > max_time_len:
                     d = d[:, :max_time_len]
-                all_data.append(d)
-            idx += 1
-    return np.stack(all_data, axis=0)
+                pos = gi if keep_pos is None else keep_pos[gi]
+                out[pos] = d
+            gi += 1
+    return out
 
 
 def build_band_filters(fs: int, order: int = 4):
@@ -104,24 +129,28 @@ def build_band_filters(fs: int, order: int = 4):
 
 
 class PretrainEEGDataset(Dataset):
-    """Yields raw (C, T) samples, zero-padded to max_channels. Bandpass in collate."""
+    """Yields (C_padded, T) tensors. Stored raw at actual channel count;
+    padded to max_channels in __getitem__ to avoid the 2× memory spike from
+    a big np.concatenate at dataset construction time."""
 
     def __init__(self, data: np.ndarray, max_channels: int, max_time_len: int):
         if data.shape[-1] > max_time_len:
             data = data[:, :, :max_time_len]
-        N, C, T = data.shape
-        if C < max_channels:
-            pad = np.zeros((N, max_channels - C, T), dtype=np.float32)
-            data = np.concatenate([data, pad], axis=1)
-        elif C > max_channels:
+        if data.shape[1] > max_channels:
             data = data[:, :max_channels, :]
+        self.max_channels = max_channels
         self.data = torch.from_numpy(data).float()
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        return self.data[idx]
+        x = self.data[idx]                      # (C_actual, T)
+        C, T = x.shape
+        if C < self.max_channels:
+            pad = torch.zeros(self.max_channels - C, T, dtype=x.dtype)
+            x = torch.cat([x, pad], dim=0)
+        return x                                # (max_channels, T)
 
 
 class BandpassCollate:
@@ -332,7 +361,12 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--max_channels", type=int, default=64)
     parser.add_argument("--max_time_len", type=int, default=1024)
-    parser.add_argument("--max_samples_per_dataset", type=int, default=20000)
+    parser.add_argument("--max_samples_per_dataset", type=int, default=20000,
+                        help="Cap per original finetune-train dataset")
+    parser.add_argument("--tuab_pretrain_samples", type=int, default=200000,
+                        help="Cap samples from tuab/pretrain/3.0.1 (~1M available). "
+                             "Total pool = 5×max_samples_per_dataset + this. Raw memory "
+                             "= N × 64 × 1024 × 4 bytes; 200k ≈ 52 GB.")
     parser.add_argument("--fs", type=int, default=256)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--d_model", type=int, default=128)
@@ -358,12 +392,16 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    # Each entry: (dataset, version, split, max_samples, subfolder)
     pretrain_info = [
-        ("tuab",        "3.0.1", "train", args.max_samples_per_dataset),
-        ("tuev",        "2.0.0", "train", args.max_samples_per_dataset),
-        ("bcic_2a",     "1.0.0", "train", None),
-        ("seed_iv",     "1.0.0", "train", args.max_samples_per_dataset),
-        ("siena_scalp", "1.0.0", "train", args.max_samples_per_dataset),
+        # Large TUAB pretrain split (~1M samples available; capped by --tuab_pretrain_samples)
+        ("tuab",        "3.0.1", "train", args.tuab_pretrain_samples, "pretrain"),
+        # Original 5-dataset finetune-train pool
+        ("tuab",        "3.0.1", "train", args.max_samples_per_dataset, "finetune"),
+        ("tuev",        "2.0.0", "train", args.max_samples_per_dataset, "finetune"),
+        ("bcic_2a",     "1.0.0", "train", None,                         "finetune"),
+        ("seed_iv",     "1.0.0", "train", args.max_samples_per_dataset, "finetune"),
+        ("siena_scalp", "1.0.0", "train", args.max_samples_per_dataset, "finetune"),
     ]
 
     logger.info(f"ACTSNetv2 Pretrain | device: {device}")
@@ -375,17 +413,18 @@ def main():
 
     datasets = []
     total = 0
-    for ds_name, version, split, max_s in pretrain_info:
+    for ds_name, version, split, max_s, subfolder in pretrain_info:
         try:
             root = get_eegfm_root(ds_name)
-            logger.info(f"Loading {ds_name}/{split} from {root} ...")
+            logger.info(f"Loading {ds_name}/{subfolder}/{split} from {root} ...")
             data = load_arrow_data(root, ds_name, version, split,
-                                   max_samples=max_s, max_time_len=args.max_time_len)
+                                   max_samples=max_s, max_time_len=args.max_time_len,
+                                   subfolder=subfolder)
             ds = PretrainEEGDataset(data, max_channels=args.max_channels,
                                     max_time_len=args.max_time_len)
             datasets.append(ds)
             total += len(ds)
-            logger.info(f"  {ds_name}: {len(ds)} samples, raw shape={data.shape}")
+            logger.info(f"  {ds_name}/{subfolder}: {len(ds)} samples, raw shape={data.shape}")
         except Exception as e:
             logger.warning(f"  Skipping {ds_name}: {e}")
 
