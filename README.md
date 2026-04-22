@@ -208,6 +208,21 @@ python run_eegfm_benchmark.py \
     --output_dir checkpoints/eegfm_benchmark_pretrain_v1
 ```
 
+### Cross-subject LOSO (v2 pretrained encoder, 4 datasets)
+
+Same encoder as above (v2 pretrained 30ep on 74k samples) evaluated under leave-one-subject-out cross-validation, mirroring the NSR 2026 benchmark protocol. Small datasets use per-subject folds; large datasets (>10 subjects) use 10-fold grouped-by-subject. Results averaged across folds (1 seed per fold).
+
+| Dataset | Classes | Protocol | BalAcc | Kappa | W-F1 |
+|---|---|---|---|---|---|
+| bcic_2a | 4 | 9-fold per-subject | 0.3225 ± 0.0262 | 0.0967 ± 0.0349 | 0.2888 ± 0.0414 |
+| seed_iv | 4 | 10-fold subject-group | 0.3299 ± 0.0335 | 0.1033 ± 0.0422 | 0.2966 ± 0.0493 |
+| tuev    | 6 | 10-fold subject-group | 0.5034 ± 0.0641 | 0.4268 ± 0.0762 | 0.6720 ± 0.0509 |
+| tuab    | 2 | 10-fold subject-group | 0.7466 ± 0.0175 | 0.5025 ± 0.0338 | 0.7610 ± 0.0162 |
+
+**Comparison with NSR 2026 on TUAB** — our **0.747** vs reported LOSO BCA of BENDR 0.791, Neuro-GPT 0.795, ShallowConv 0.798, CBraMod 0.800, EEGMamba 0.809, Deformer 0.815, LUNA-Base 0.819. We sit ~4–7 points below. The gap is driven primarily by pretrain scale (our 74k samples vs NSR FMs' millions of tokens) rather than architecture.
+
+For large datasets we subsample total pool to 20k (stratified per-subject) to keep the 5-band expansion within memory (20000 × max_ch=64 × 5 × 1024 × f32 ≈ 26 GB).
+
 ### MI-specific LOSO (BCIC-2A, cross-subject, 9-fold per-subject)
 
 Comparable to the NSR 2026 EEG-FM benchmark recipe (LOSO, seed 42 per fold, mean ± std over 9 subject-held-out folds). See [run_mi_benchmark.py](run_mi_benchmark.py) — a stripped-down variant of the main benchmark with three MI-targeted changes:

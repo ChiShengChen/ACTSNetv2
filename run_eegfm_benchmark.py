@@ -111,30 +111,82 @@ def get_eegfm_root(dataset_name: str | None = None):
 # ──────────────────────────────────────────────
 def load_arrow_all_with_subject(
     root: str, dataset: str, version: str, max_time_len: int | None = None,
+    max_samples: int | None = None, seed: int = 42,
 ):
-    """Pool train+validation+test splits, keeping subject IDs."""
-    all_data, all_labels, all_subj = [], [], []
-    for split in ("train", "validation", "test"):
-        base_dir = os.path.join(root, dataset, "finetune", version)
-        prefix = f"{dataset}-{split}-"
-        shards = sorted([
-            os.path.join(base_dir, f)
-            for f in os.listdir(base_dir)
-            if f.startswith(prefix) and f.endswith(".arrow")
-        ])
-        for shard_path in shards:
-            table = ipc.open_stream(shard_path).read_all()
-            for i in range(len(table)):
-                d = np.array(table.column("data")[i].as_py(), dtype=np.float32)
+    """Pool train+validation+test splits, keeping subject IDs.
+
+    Memory-safe: two-pass loader. Pass 1 collects only subject metadata and
+    decides which global indices to keep (stratified per-subject subsampling
+    if max_samples is set). Pass 2 pre-allocates exact-size output arrays and
+    loads only the selected indices, avoiding a giant Python list of numpy
+    arrays (the cause of earlier OOM on tuab's 272k samples).
+    """
+    base_dir_fmt = os.path.join(root, dataset, "finetune", version)
+
+    def _iter_shards():
+        for split in ("train", "validation", "test"):
+            prefix = f"{dataset}-{split}-"
+            shards = sorted([
+                os.path.join(base_dir_fmt, f)
+                for f in os.listdir(base_dir_fmt)
+                if f.startswith(prefix) and f.endswith(".arrow")
+            ])
+            for s in shards:
+                yield s
+
+    # --- Pass 1: subject metadata + shape probe ---
+    subject_per_idx: list[str] = []
+    probe_shape = None
+    for shard_path in _iter_shards():
+        table = ipc.open_stream(shard_path).read_all()
+        if probe_shape is None and len(table) > 0:
+            d0 = np.asarray(table.column("data")[0].as_py(), dtype=np.float32)
+            probe_shape = d0.shape  # (C, T)
+        subject_per_idx.extend(str(s.as_py()) for s in table.column("subject"))
+    subject_per_idx = np.array(subject_per_idx)
+    total = len(subject_per_idx)
+    if probe_shape is None:
+        raise RuntimeError(f"No samples found for {dataset}")
+    C, T_raw = probe_shape
+    T = min(T_raw, max_time_len) if max_time_len is not None else T_raw
+
+    # --- Decide which indices to keep ---
+    if max_samples is not None and total > max_samples:
+        unique_subj = np.unique(subject_per_idx)
+        per_subj_cap = max(1, max_samples // len(unique_subj))
+        rng = np.random.RandomState(seed)
+        keep_idx_set: set[int] = set()
+        for s in unique_subj:
+            s_idx = np.where(subject_per_idx == s)[0]
+            if len(s_idx) > per_subj_cap:
+                s_idx = rng.choice(s_idx, per_subj_cap, replace=False)
+            keep_idx_set.update(int(i) for i in s_idx)
+        keep_idx = np.sort(np.array(sorted(keep_idx_set), dtype=np.int64))
+    else:
+        keep_idx = None
+    n_keep = len(keep_idx) if keep_idx is not None else total
+
+    # --- Pass 2: pre-allocate and fill ---
+    data = np.empty((n_keep, C, T), dtype=np.float32)
+    labels = np.empty((n_keep,), dtype=np.int64)
+    subjects_out = np.empty((n_keep,), dtype=subject_per_idx.dtype)
+    keep_set = set(keep_idx.tolist()) if keep_idx is not None else None
+    keep_pos_map = {g: p for p, g in enumerate(keep_idx.tolist())} if keep_idx is not None else None
+
+    global_idx = 0
+    for shard_path in _iter_shards():
+        table = ipc.open_stream(shard_path).read_all()
+        for i in range(len(table)):
+            if keep_set is None or global_idx in keep_set:
+                d = np.asarray(table.column("data")[i].as_py(), dtype=np.float32)
                 if max_time_len is not None and d.shape[-1] > max_time_len:
                     d = d[:, :max_time_len]
-                all_data.append(d)
-                all_labels.append(int(table.column("label")[i].as_py()))
-                all_subj.append(str(table.column("subject")[i].as_py()))
-    data = np.stack(all_data, axis=0)
-    labels = np.array(all_labels, dtype=np.int64)
-    subjects = np.array(all_subj)
-    return data, labels, subjects
+                pos = global_idx if keep_pos_map is None else keep_pos_map[global_idx]
+                data[pos] = d
+                labels[pos] = int(table.column("label")[i].as_py())
+                subjects_out[pos] = subject_per_idx[global_idx]
+            global_idx += 1
+    return data, labels, subjects_out
 
 
 def load_arrow_split(
@@ -307,29 +359,13 @@ def run_single_dataset_loso(
     logger.info(f"Loading {dataset_name} (all splits, with subject IDs) ...")
     t0 = time.time()
     data, labels, subjects = load_arrow_all_with_subject(
-        eegfm_root, dataset_name, version, max_time_len=max_time_len,
+        eegfm_root, dataset_name, version,
+        max_time_len=max_time_len,
+        max_samples=max_total_samples,   # memory-safe: subsample during read
+        seed=seed,
     )
     logger.info(f"  Loaded {len(data)} samples in {time.time()-t0:.0f}s "
                 f"| shape {data.shape} | unique subjects: {len(np.unique(subjects))}")
-
-    # Memory cap: subsample total pool (stratified per subject) if too big.
-    # Bandpass expansion is 5× so pool must fit within ~100 GB post-expansion.
-    if max_total_samples is not None and len(data) > max_total_samples:
-        rng = np.random.RandomState(seed)
-        unique_subj = np.unique(subjects)
-        per_subj_cap = max(1, max_total_samples // len(unique_subj))
-        keep_idx = []
-        for s in unique_subj:
-            s_idx = np.where(subjects == s)[0]
-            if len(s_idx) > per_subj_cap:
-                s_idx = rng.choice(s_idx, per_subj_cap, replace=False)
-            keep_idx.append(s_idx)
-        keep_idx = np.sort(np.concatenate(keep_idx))
-        data = data[keep_idx]
-        labels = labels[keep_idx]
-        subjects = subjects[keep_idx]
-        logger.info(f"  Subsampled to {len(data)} samples "
-                    f"(~{per_subj_cap}/subject, stratified)")
 
     # Zero-pad channels if using pretrained_path with max_channels
     if pretrained_path is not None and max_channels is not None:
