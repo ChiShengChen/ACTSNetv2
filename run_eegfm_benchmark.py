@@ -136,21 +136,27 @@ def load_arrow_all_with_subject(
             for s in shards:
                 yield s
 
-    # --- Pass 1: subject metadata + shape probe ---
+    # --- Pass 1: subject metadata + shape scan ---
+    # Some datasets (e.g. tusl) have variable channel counts across shards;
+    # scan all shards to find max C so pass-2 output can pad uniformly.
     subject_per_idx: list[str] = []
-    probe_shape = None
+    max_C = 0
+    probe_T = None
     for shard_path in _iter_shards():
         table = ipc.open_stream(shard_path).read_all()
-        if probe_shape is None and len(table) > 0:
-            d0 = np.asarray(table.column("data")[0].as_py(), dtype=np.float32)
-            probe_shape = d0.shape  # (C, T)
+        for i in range(len(table)):
+            d = np.asarray(table.column("data")[i].as_py(), dtype=np.float32)
+            if d.shape[0] > max_C:
+                max_C = d.shape[0]
+            if probe_T is None:
+                probe_T = d.shape[1]
         subject_per_idx.extend(str(s.as_py()) for s in table.column("subject"))
     subject_per_idx = np.array(subject_per_idx)
     total = len(subject_per_idx)
-    if probe_shape is None:
+    if max_C == 0:
         raise RuntimeError(f"No samples found for {dataset}")
-    C, T_raw = probe_shape
-    T = min(T_raw, max_time_len) if max_time_len is not None else T_raw
+    C = max_C
+    T = min(probe_T, max_time_len) if max_time_len is not None else probe_T
 
     # --- Decide which indices to keep ---
     if max_samples is not None and total > max_samples:
@@ -168,8 +174,8 @@ def load_arrow_all_with_subject(
         keep_idx = None
     n_keep = len(keep_idx) if keep_idx is not None else total
 
-    # --- Pass 2: pre-allocate and fill ---
-    data = np.empty((n_keep, C, T), dtype=np.float32)
+    # --- Pass 2: pre-allocate and fill; zero-pad per-sample to max C ---
+    data = np.zeros((n_keep, C, T), dtype=np.float32)
     labels = np.empty((n_keep,), dtype=np.int64)
     subjects_out = np.empty((n_keep,), dtype=subject_per_idx.dtype)
     keep_set = set(keep_idx.tolist()) if keep_idx is not None else None
@@ -184,7 +190,7 @@ def load_arrow_all_with_subject(
                 if max_time_len is not None and d.shape[-1] > max_time_len:
                     d = d[:, :max_time_len]
                 pos = global_idx if keep_pos_map is None else keep_pos_map[global_idx]
-                data[pos] = d
+                data[pos, :d.shape[0], :d.shape[1]] = d   # pad with zeros if C < max_C
                 labels[pos] = int(table.column("label")[i].as_py())
                 subjects_out[pos] = subject_per_idx[global_idx]
             global_idx += 1

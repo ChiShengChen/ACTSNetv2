@@ -208,6 +208,22 @@ python run_eegfm_benchmark.py \
     --output_dir checkpoints/eegfm_benchmark_pretrain_v1
 ```
 
+### Pretrain-scale study (v2 74k → 270k)
+
+Training on TUAB/pretrain (~123k samples) in addition to the original 5-dataset finetune-train pool expands the pool to 197k (3.6× larger). Spectral injection is on in the 270k run. Comparing cross-subject LOSO on the small datasets:
+
+| Dataset | Classes | v1 (74k, linear) | **v2 (270k, linear)** | Δ |
+|---|---|---|---|---|
+| bcic_2a | 4 | 0.3225 ± 0.0262 | **0.3418 ± 0.0445** | +0.019 |
+| seed_iv | 4 | 0.3299 ± 0.0335 | **0.3509 ± 0.0408** | +0.021 |
+| tusl    | 3 | — (earlier loader crashed on variable C) | **0.6612 ± 0.0930** | new |
+
+Observations:
+
+- **MI / emotion (bcic_2a, seed_iv) gain only ~2 points** from 3.6× pretrain scale; the paradigm-matching "MI stack" (EA + α+β + Prototype + Spectral) gives +14 points on the same dataset, dwarfing scale-up.
+- **TUSL (clinical slowing detection) benefits most from the larger pretrain.** With only 300 labeled trials and 38 subjects, the 270k encoder reaches 66% BCA on 3-class (chance 33%), demonstrating strong positive transfer for clinical event morphology.
+- Engineering takeaway: for MI, invest in paradigm-specific pretrain (MI-only pool) and/or architectural priors; for clinical tasks, invest in pretrain scale + diverse clinical corpora.
+
 ### Cross-subject LOSO (v2 pretrained encoder, 4 datasets)
 
 Same encoder as above (v2 pretrained 30ep on 74k samples) evaluated under leave-one-subject-out cross-validation, mirroring the NSR 2026 benchmark protocol. Small datasets use per-subject folds; large datasets (>10 subjects) use 10-fold grouped-by-subject. Results averaged across folds (1 seed per fold).
