@@ -214,10 +214,14 @@ Training on TUAB/pretrain (~123k samples) in addition to the original 5-dataset 
 
 | Dataset | Classes | v1 (74k, linear) | **v2 (270k, linear)** | Δ |
 |---|---|---|---|---|
-| bcic_2a | 4 | 0.3225 ± 0.0262 | **0.3418 ± 0.0445** | +0.019 |
-| seed_iv | 4 | 0.3299 ± 0.0335 | **0.3509 ± 0.0408** | +0.021 |
-| tusl    | 3 | — (earlier loader crashed on variable C) | **0.6612 ± 0.0930** | new |
-| tuab    | 2 | 0.7466 ± 0.0175 | **0.7542 ± 0.0171** | +0.008 |
+| bcic_2a     | 4 | 0.3225 ± 0.0262 | **0.3418 ± 0.0445** | +0.019 |
+| seed_iv     | 4 | 0.3299 ± 0.0335 | **0.3509 ± 0.0408** | +0.021 |
+| tuab        | 2 | 0.7466 ± 0.0175 | **0.7542 ± 0.0171** | +0.008 |
+| tuev        | 6 | 0.5034 ± 0.0641 | **0.5366 ± 0.0592** | **+0.033** |
+| tusl        | 3 | — (earlier loader crashed on variable C) | **0.6612 ± 0.0930** | new |
+| siena_scalp | 2 | — | 0.5583 ± 0.0736 (see caveat) | new |
+
+**Caveat on siena_scalp**: F1-weighted is 0.99 but balanced accuracy is only 0.56 and Cohen's κ is 0.11 (± 0.15). On several LOSO folds the model collapses to predicting only the majority (non-seizure) class — typical of severely imbalanced 2-class seizure detection. Not a meaningful result; needs class-balanced loss or focal loss to be reportable.
 
 Observations:
 
