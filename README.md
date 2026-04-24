@@ -217,6 +217,7 @@ Training on TUAB/pretrain (~123k samples) in addition to the original 5-dataset 
 | bcic_2a | 4 | 0.3225 ± 0.0262 | **0.3418 ± 0.0445** | +0.019 |
 | seed_iv | 4 | 0.3299 ± 0.0335 | **0.3509 ± 0.0408** | +0.021 |
 | tusl    | 3 | — (earlier loader crashed on variable C) | **0.6612 ± 0.0930** | new |
+| tuab    | 2 | 0.7466 ± 0.0175 | **0.7542 ± 0.0171** | +0.008 |
 
 Observations:
 
